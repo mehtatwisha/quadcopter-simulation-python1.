@@ -1,0 +1,125 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+
+# ================= 1. SIMULATION =================
+m, g = 1.0, 9.81
+dt, T_total = 0.01, 70.0
+waypoints = [(0, 0, 5), (6, 0, 5), (6, 6, 5), (0, 6, 8), (0, 0, 8), (0, 0, 0.3)]
+reach_dist = 0.3
+
+kp, kd, ki = 1.2, 2.0, 0.3
+kpz, kdz = 4.0, 3.5
+kpa, kda = 50.0, 10.0
+a_max, tilt_max = 3.0, 0.35
+
+x = y = z = vx = vy = vz = 0.0
+phi = theta = p = q = ix = iy = 0.0
+wp = 0
+N = int(T_total / dt)
+S = np.zeros((N, 6))   # x, y, z, roll, pitch, time
+
+for step in range(N):
+    t = step * dt
+    tx, ty, tz = waypoints[wp]
+    ex, ey, ez = tx - x, ty - y, tz - z
+    dist = np.sqrt(ex**2 + ey**2 + ez**2)
+    if dist < reach_dist and wp < len(waypoints) - 1:
+        wp += 1
+        ix = iy = 0.0
+    if dist < 1.5:
+        ix = np.clip(ix + ex * dt, -3, 3)
+        iy = np.clip(iy + ey * dt, -3, 3)
+
+    ax_cmd = np.clip(kp * ex - kd * vx + ki * ix, -a_max, a_max)
+    ay_cmd = np.clip(kp * ey - kd * vy + ki * iy, -a_max, a_max)
+    az_cmd = np.clip(kpz * ez - kdz * vz, -4.0, 6.0)
+
+    denom = g + az_cmd
+    thrust = np.clip(m * denom / max(np.cos(phi) * np.cos(theta), 0.5), 0.0, 30.0)
+    theta_des = np.clip(ax_cmd / denom, -tilt_max, tilt_max)
+    phi_des = np.clip(-ay_cmd / denom, -tilt_max, tilt_max)
+
+    p += kpa * (phi_des - phi) * dt - kda * p * dt
+    q += kpa * (theta_des - theta) * dt - kda * q * dt
+
+    wind_x, wind_y = (1.0, 0.5) if 20 <= t < 30 else (0.0, 0.0)
+    ax = (thrust / m) * np.cos(phi) * np.sin(theta) + wind_x
+    ay = -(thrust / m) * np.sin(phi) + wind_y
+    az = (thrust / m) * np.cos(phi) * np.cos(theta) - g
+
+    vx += ax * dt; x += vx * dt
+    vy += ay * dt; y += vy * dt
+    vz += az * dt; z += vz * dt
+    phi += p * dt
+    theta += q * dt
+    if z < 0:
+        z, vz = 0.0, max(vz, 0.0)
+
+    S[step] = [x, y, z, phi, theta, t]
+
+# ================= 2. DRONE 3D MODEL =================
+ARM = 0.6        # arm length (m), drawn bigger than real for visibility
+ROTOR_R = 0.28   # rotor radius (m)
+
+# Rotor centers in the drone's own frame (X shape): front-right, front-left, back-left, back-right
+d = ARM / np.sqrt(2)
+rotor_centers = np.array([[d, -d, 0], [d, d, 0], [-d, d, 0], [-d, -d, 0]])
+ang = np.linspace(0, 2 * np.pi, 30)
+circle = np.stack([ROTOR_R * np.cos(ang), ROTOR_R * np.sin(ang), np.zeros_like(ang)])
+
+def rotation(roll, pitch):
+    Rx = np.array([[1, 0, 0],
+                   [0, np.cos(roll), -np.sin(roll)],
+                   [0, np.sin(roll),  np.cos(roll)]])
+    Ry = np.array([[ np.cos(pitch), 0, np.sin(pitch)],
+                   [0, 1, 0],
+                   [-np.sin(pitch), 0, np.cos(pitch)]])
+    return Ry @ Rx
+
+# ================= 3. ANIMATION =================
+fig = plt.figure(figsize=(9, 8))
+ax3 = fig.add_subplot(111, projection="3d")
+ax3.set_xlim(-1, 7); ax3.set_ylim(-1, 7); ax3.set_zlim(0, 9)
+ax3.set_box_aspect((8, 8, 9))
+ax3.set_xlabel("x (m)"); ax3.set_ylabel("y (m)"); ax3.set_zlabel("z (m)")
+ax3.set_title("Quadcopter 3D model")
+
+wx, wy, wz = zip(*waypoints)
+ax3.scatter(wx, wy, wz, color="red", s=30, label="Waypoints")
+
+arm1, = ax3.plot([], [], [], color="black", lw=4)    # front-right <-> back-left
+arm2, = ax3.plot([], [], [], color="black", lw=4)    # front-left <-> back-right
+rotor_lines = [ax3.plot([], [], [], color=("red" if i < 2 else "dodgerblue"), lw=2)[0]
+               for i in range(4)]                     # red = front, blue = back
+body, = ax3.plot([], [], [], "o", color="black", ms=8)
+trail, = ax3.plot([], [], [], color="green", lw=1, alpha=0.7, label="Trail")
+shadow, = ax3.plot([], [], [], "o", color="gray", alpha=0.4, ms=6)
+info = ax3.text2D(0.02, 0.95, "", transform=ax3.transAxes)
+ax3.legend(loc="upper right")
+
+SKIP = 4  # draw every 4th simulation step
+
+def update(i):
+    k = i * SKIP
+    px, py, pz, roll, pitch, t = S[k]
+    R = rotation(roll, pitch)
+    pos = np.array([px, py, pz])
+
+    c = (R @ rotor_centers.T).T + pos          # rotor centers in world frame
+    arm1.set_data_3d([c[0, 0], c[2, 0]], [c[0, 1], c[2, 1]], [c[0, 2], c[2, 2]])
+    arm2.set_data_3d([c[1, 0], c[3, 0]], [c[1, 1], c[3, 1]], [c[1, 2], c[3, 2]])
+
+    for n in range(4):
+        pts = R @ circle + c[n].reshape(3, 1)
+        rotor_lines[n].set_data_3d(pts[0], pts[1], pts[2])
+
+    body.set_data_3d([px], [py], [pz])
+    trail.set_data_3d(S[:k + 1:5, 0], S[:k + 1:5, 1], S[:k + 1:5, 2])
+    shadow.set_data_3d([px], [py], [0])
+    info.set_text(f"t = {t:4.1f} s   roll = {np.degrees(roll):5.1f}°   "
+                  f"pitch = {np.degrees(pitch):5.1f}°" + ("   WIND" if 20 <= t < 30 else ""))
+    return arm1, arm2, *rotor_lines, body, trail, shadow, info
+
+anim = FuncAnimation(fig, update, frames=N // SKIP, interval=30, blit=False)
+plt.show()
